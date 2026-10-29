@@ -1,0 +1,221 @@
+openapi: 3.0.3
+info:
+  title: Mini Operations ERP API
+  version: 1.0.0
+  description: All endpoints except /auth/login and /health require header `Authorization: Bearer <token>`. Errors are returned as `{ "error": "message" }`.
+servers:
+  - url: http://localhost:3001/api
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+    StockRow:
+      type: object
+      properties:
+        id: { type: integer }
+        location: { type: string }
+        sku: { type: string }
+        item: { type: string }
+        batch: { type: string }
+        physical_quantity: { type: integer }
+        reserved_quantity: { type: integer }
+        available_quantity: { type: integer, description: physical - reserved }
+    WorkOrder:
+      type: object
+      properties:
+        id: { type: integer }
+        work_order_code: { type: string, example: WO-000001 }
+        location: { type: string }
+        item: { type: string }
+        required_quantity: { type: integer }
+        shortage: { type: integer, description: max(0, required - available at location) }
+        assigned_user: { type: string }
+        status: { type: string, enum: [ASSIGNED, IN_PROGRESS, COMPLETED] }
+    Transfer:
+      type: object
+      properties:
+        id: { type: integer }
+        transfer_code: { type: string, example: TR-000001 }
+        source_location: { type: string }
+        destination_location: { type: string }
+        item: { type: string }
+        quantity: { type: integer }
+        status: { type: string, enum: [REQUESTED, DISPATCHED, RECEIVED] }
+    CustomerOrder:
+      type: object
+      properties:
+        id: { type: integer }
+        order_code: { type: string, example: ORD-000001 }
+        customer_name: { type: string }
+        location: { type: string }
+        item: { type: string }
+        quantity: { type: integer }
+        status: { type: string, enum: [RESERVED, COMPLETED, CANCELLED] }
+security:
+  - bearer: []
+paths:
+  /auth/login:
+    post:
+      security: []
+      summary: Log in and receive a JWT
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string, example: sales }
+                password: { type: string, example: password123 }
+      responses:
+        '200': { description: Token and user info }
+        '401': { description: Invalid credentials }
+  /auth/me:
+    get:
+      summary: Current user from token
+      responses:
+        '200': { description: Current user }
+        '401': { description: Missing or invalid token }
+  /master/locations:
+    get: { summary: List locations, responses: { '200': { description: OK } } }
+  /master/items:
+    get: { summary: List items, responses: { '200': { description: OK } } }
+  /master/users:
+    get: { summary: List users (for work order assignment), responses: { '200': { description: OK } } }
+  /inventory:
+    get:
+      summary: List stock with available quantity
+      parameters:
+        - { name: location_id, in: query, schema: { type: integer } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/StockRow' } } } } }
+  /inventory/stock-in:
+    post:
+      summary: Add physical stock (Admin, Operations User)
+      description: Idempotent. Re-sending the same idempotency_key returns 409 and applies nothing.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [location_id, item_id, quantity, idempotency_key]
+              properties:
+                location_id: { type: integer }
+                item_id: { type: integer }
+                quantity: { type: integer, minimum: 1 }
+                batch: { type: string, description: Defaults to DEFAULT }
+                idempotency_key: { type: string }
+      responses:
+        '201': { description: Stock added }
+        '400': { description: Validation error }
+        '403': { description: Role not allowed }
+        '409': { description: Duplicate idempotency key }
+  /work-orders:
+    get:
+      summary: List work orders
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/WorkOrder' } } } } }
+    post:
+      summary: Create work order with shortage calculation (Admin only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [location_id, item_id, required_quantity, assigned_user_id]
+              properties:
+                location_id: { type: integer }
+                item_id: { type: integer }
+                required_quantity: { type: integer, minimum: 1 }
+                assigned_user_id: { type: integer }
+      responses:
+        '201': { description: Created }
+        '403': { description: Role not allowed }
+  /work-orders/{id}/advance:
+    patch:
+      summary: Move status ASSIGNED -> IN_PROGRESS -> COMPLETED (Admin, Operations User)
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Updated }
+        '409': { description: Already completed }
+  /transfers:
+    get:
+      summary: List internal transfers
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Transfer' } } } } }
+    post:
+      summary: Request a transfer. Checks source available stock; does not move stock yet (Admin, Operations User)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source_location_id, destination_location_id, item_id, quantity]
+              properties:
+                source_location_id: { type: integer }
+                destination_location_id: { type: integer }
+                item_id: { type: integer }
+                quantity: { type: integer, minimum: 1 }
+      responses:
+        '201': { description: Created }
+        '409': { description: Insufficient available stock at source }
+  /transfers/{id}/dispatch:
+    patch:
+      summary: REQUESTED -> DISPATCHED. Reduces source physical stock (Admin, Operations User)
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Dispatched }
+        '409': { description: Wrong status or insufficient stock }
+  /transfers/{id}/receive:
+    patch:
+      summary: DISPATCHED -> RECEIVED. Increases destination physical stock. Can only succeed once (Admin, Operations User)
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Received }
+        '409': { description: Already received or not dispatched }
+  /orders:
+    get:
+      summary: List customer orders
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/CustomerOrder' } } } } }
+    post:
+      summary: Create order and reserve stock atomically (Admin, Sales User)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [location_id, item_id, quantity, customer_name]
+              properties:
+                location_id: { type: integer }
+                item_id: { type: integer }
+                quantity: { type: integer, minimum: 1 }
+                customer_name: { type: string }
+      responses:
+        '201': { description: Created and reserved }
+        '409': { description: Insufficient available stock }
+  /orders/{id}/cancel:
+    patch:
+      summary: Cancel a RESERVED order and release reservation (Admin, Sales User)
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Cancelled }
+        '409': { description: Order not RESERVED }
+  /orders/{id}/complete:
+    patch:
+      summary: Ship a RESERVED order; physical and reserved both decrease (Admin, Sales User)
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Completed }
+        '409': { description: Order not RESERVED }
